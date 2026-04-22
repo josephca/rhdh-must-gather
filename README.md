@@ -70,6 +70,45 @@ helm install my-rhdh-must-gather redhat-developer-hub-must-gather \
 
 See the [chart documentation](https://github.com/redhat-developer/rhdh-chart/tree/main/charts/must-gather) for all available options.
 
+## Hermetic build (Hermeto / Konflux-style)
+
+The root `Containerfile` is what Konflux-style builds use in this repository. [Hermeto](https://github.com/hermetoproject/hermeto) must cache dependencies first so the build is **reproducible**, **offline**, and **hermetically sealed** (no network during `podman build`).
+
+Hermeto **prefetches** dependencies into a cache and **emits** `cachi2.env`. A **transformed** `Containerfile` **sources** that environment on each `RUN` and **points DNF** at the cached RPM repository, after which the image is built with **`podman build --network none`**. See [Generating environment variables](https://github.com/hermetoproject/hermeto/blob/main/docs/usage.md#generate-environment-variables) in the Hermeto documentation for how `cachi2` is wired into `RUN` instructions.
+
+Here, cached inputs are **RPMs** and **generic URL** artifacts (not pip/yarn as in the main RHDH image). Lockfiles:
+
+- **RPM**: `rpms.in.yaml` and `rpms.lock.yaml` (regeneration: see comments in `rpms.in.yaml`).
+- **Generic URL**: `artifacts.lock.yaml` (for example oc/kubectl, yq, Helm, websocat). When you bump versions in the `Containerfile`, update entries and checksums in this lockfile.
+
+**Platform:** the Hermeto lockfiles and RPM paths target **linux/amd64** (x86_64). The local script defaults `TARGET_PLATFORM` to `linux/amd64`; override only if you understand the implications.
+
+### Build locally
+
+Use [`scripts/local-hermeto-build.sh`](./scripts/local-hermeto-build.sh) from the repository root. It:
+
+- creates a Hermeto cache in `./hermeto-cache/`
+- generates a transformed `Containerfile` that uses the cache (injects `cachi2` environment variables on `RUN` lines and points DNF at the Hermeto RPM repository)
+
+```bash
+# create the Hermeto cache and build the image
+./scripts/local-hermeto-build.sh -d . -i image:tag
+```
+
+Example:
+
+```bash
+./scripts/local-hermeto-build.sh -d . -i localhost/rhdh-must-gather:hermetic
+# cache only (no image):
+./scripts/local-hermeto-build.sh -d . --no-image
+```
+
+**Before you run the script:** requires **Podman**, **rsync**, and on macOS **GNU sed** (for example `brew install gnu-sed` and put `gnubin` on your `PATH`). The script’s `--help` lists options such as `--no-cache` and `--file`.
+
+**Konflux:** set pipeline `prefetch-input` to include **both** `rpm` and `generic`, matching the script:
+
+`[{"type": "rpm", "path": "."}, {"type": "generic", "path": "."}]`
+
 ## What data is collected
 
 See [data-collected.md](./docs/data-collected.md) for more details.
@@ -94,16 +133,16 @@ For running in airgapped environments (partially or fully disconnected), see [di
 
 ### Environment Variables
 
-| Variable                 | Default         | Description                                            |
-|--------------------------|-----------------|--------------------------------------------------------|
-| `BASE_COLLECTION_PATH`   | `/must-gather`  | Output directory for collected data                    |
-| `LOG_LEVEL`              | `info`          | Logging level (info, debug, trace)                     |
-| `CMD_TIMEOUT`            | `30`            | Timeout for individual kubectl/helm commands (seconds) |
-| `MUST_GATHER_SINCE`      | -               | Relative time for log collection (e.g., "2h", "30m")   |
-| `MUST_GATHER_SINCE_TIME` | -               | Absolute timestamp for log collection (RFC3339)        |
-| `HEAP_DUMP_TIMEOUT`      | `600`           | Timeout for heap dump collection in seconds            |
-| `HEAP_DUMP_BUFFER_SIZE`  | `16777216`      | WebSocket buffer size in bytes (16MB) for inspector method |
-| `HEAP_DUMP_REMOTE_DIR`   | `/tmp`          | Directory in container for heap dumps (SIGUSR2 method) |
+| Variable                 | Default        | Description                                                |
+| ------------------------ | -------------- | ---------------------------------------------------------- |
+| `BASE_COLLECTION_PATH`   | `/must-gather` | Output directory for collected data                        |
+| `LOG_LEVEL`              | `info`         | Logging level (info, debug, trace)                         |
+| `CMD_TIMEOUT`            | `30`           | Timeout for individual kubectl/helm commands (seconds)     |
+| `MUST_GATHER_SINCE`      | -              | Relative time for log collection (e.g., "2h", "30m")       |
+| `MUST_GATHER_SINCE_TIME` | -              | Absolute timestamp for log collection (RFC3339)            |
+| `HEAP_DUMP_TIMEOUT`      | `600`          | Timeout for heap dump collection in seconds                |
+| `HEAP_DUMP_BUFFER_SIZE`  | `16777216`     | WebSocket buffer size in bytes (16MB) for inspector method |
+| `HEAP_DUMP_REMOTE_DIR`   | `/tmp`         | Directory in container for heap dumps (SIGUSR2 method)     |
 
 ### Command Line Options
 
@@ -130,7 +169,7 @@ Usage: ./must_gather [params...]
   --without-operator            Skip operator-based RHDH deployment data collection
   --without-orchestrator        Skip Orchestrator-flavored deployment data collection
                                 (OpenShift Serverless, Serverless Logic, SonataFlowPlatform)
-  --without-helm                Skip Helm-based RHDH deployment data collection  
+  --without-helm                Skip Helm-based RHDH deployment data collection
   --without-platform            Skip platform detection and information
   --without-route               Skip OpenShift route collection
   --without-ingress             Skip Kubernetes ingress collection
@@ -151,16 +190,16 @@ Usage: ./must_gather [params...]
   --with-heap-dumps             Collect heap dumps from running backstage-backend processes (opt-in, disabled by default)
                                 Heap dumps are collected immediately after pod logs for each deployment/CR
                                 Useful for troubleshooting memory leaks and performance issues
-                                
+
                                 IMPORTANT: Requires NODE_OPTIONS environment variable to be set on the backstage-backend RHDH container:
                                   NODE_OPTIONS=--heapsnapshot-signal=SIGUSR2 --diagnostic-dir=/tmp
-                                
+
                                 Why these flags?
                                   • --heapsnapshot-signal=SIGUSR2: Built into Node.js v12.0.0+, enables heap dumps
                                   • --diagnostic-dir=/tmp: REQUIRED for read-only root filesystems
-                                
+
                                 No image rebuild or source code changes needed!
-                                
+
                                 Collection method: SIGUSR2 signal sent directly via kubectl exec
                                 Works with any Kubernetes version, no special RBAC permissions needed
                                 Warning: May take several minutes and generate large files (100MB-1GB+ per pod)
@@ -200,37 +239,39 @@ Usage: ./must_gather [params...]
 
 #### Available Exclusion Flags
 
-| Flag | Description | Use Case |
-|------|-------------|----------|
-| `--without-operator` | Skip operator-based RHDH deployment data | When you know RHDH is deployed via Helm only |
-| `--without-orchestrator` | Skip Orchestrator-related data (Serverless, Serverless Logic, SonataFlowPlatform) | When you know you don't have any Orchestrator flavor instances of RHDH |
-| `--without-helm` | Skip Helm-based RHDH deployment data | When you know RHDH is deployed via Operator only |
-| `--without-platform` | Skip platform detection and information | For minimal collections when platform info is not needed |
-| `--without-route` | Skip OpenShift route collection | For non-OpenShift clusters or when routes are not relevant |
-| `--without-ingress` | Skip Kubernetes ingress collection | When ingresses are not used for RHDH access |
-| `--without-namespace-inspect` | Skip deep Namespace inspect | **Not recommended** as it removes OMC compatibility. Use only for minimal/quick collections |
+| Flag                          | Description                                                                       | Use Case                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `--without-operator`          | Skip operator-based RHDH deployment data                                          | When you know RHDH is deployed via Helm only                                                |
+| `--without-orchestrator`      | Skip Orchestrator-related data (Serverless, Serverless Logic, SonataFlowPlatform) | When you know you don't have any Orchestrator flavor instances of RHDH                      |
+| `--without-helm`              | Skip Helm-based RHDH deployment data                                              | When you know RHDH is deployed via Operator only                                            |
+| `--without-platform`          | Skip platform detection and information                                           | For minimal collections when platform info is not needed                                    |
+| `--without-route`             | Skip OpenShift route collection                                                   | For non-OpenShift clusters or when routes are not relevant                                  |
+| `--without-ingress`           | Skip Kubernetes ingress collection                                                | When ingresses are not used for RHDH access                                                 |
+| `--without-namespace-inspect` | Skip deep Namespace inspect                                                       | **Not recommended** as it removes OMC compatibility. Use only for minimal/quick collections |
 
 #### Namespace Filtering
 
-| Flag | Description | Use Case |
-|------|-------------|----------|
+| Flag                   | Description                                              | Use Case                                           |
+| ---------------------- | -------------------------------------------------------- | -------------------------------------------------- |
 | `--namespaces ns1,ns2` | Limit collection to specified comma-separated namespaces | When RHDH is deployed in specific known namespaces |
-| `--namespaces=ns1,ns2` | Alternative syntax for namespace filtering | Same as above with equals syntax |
+| `--namespaces=ns1,ns2` | Alternative syntax for namespace filtering               | Same as above with equals syntax                   |
 
 **Examples:**
+
 - `--namespaces rhdh-prod,rhdh-staging` - Collect only from production and staging namespaces
 - `--namespaces=my-rhdh-ns` - Collect only from a single namespace
 - Combine with exclusions: `--namespaces prod-ns --without-helm` - Only operator data from prod-ns
 
 #### Optional feature flags
 
-| Flag | Description | Use Case |
-|------|-------------|----------|
-| `--cluster-info` | Collect cluster-wide diagnostic information | For comprehensive cluster analysis |
-| `--with-secrets` | Include Kubernetes Secrets (sanitized) | For detailed troubleshooting requiring secret metadata |
+| Flag                | Description                                          | Use Case                                               |
+| ------------------- | ---------------------------------------------------- | ------------------------------------------------------ |
+| `--cluster-info`    | Collect cluster-wide diagnostic information          | For comprehensive cluster analysis                     |
+| `--with-secrets`    | Include Kubernetes Secrets (sanitized)               | For detailed troubleshooting requiring secret metadata |
 | `--with-heap-dumps` | Collect heap dumps from backstage-backend containers | For memory leak investigation and performance analysis |
 
 **Examples:**
+
 - `--with-heap-dumps` - Collect heap dumps for all backstage-backend pods
 - `--with-secrets --with-heap-dumps` - Full diagnostic collection
 - `--namespaces prod-ns --with-heap-dumps` - Heap dumps from specific namespace only
